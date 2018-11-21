@@ -34,7 +34,7 @@ Similar to DDPG algorithm, a noise was injected into the acitons selected to pro
 
 ## Plots
 
-Looking at the average score over 100 episodes, it appears that the agent solves the environment at around 2250 episodes meaning that the agent was able to average 0.50+ scores from around episodes 2150 to 2250. Given the difficulty of getting multiple agents with their own value and actor functions to cooporate, 2000 iteration does not seem so bad. 
+Looking at the average score over 100 episodes, it appears that the agent solves the environment at around 2230 episodes meaning that the agent was able to average 0.50+ scores from around episodes 2130 to 2230. Given the difficulty of getting multiple agents with their own value and actor functions to cooporate, 2000 iteration does not seem so bad. 
 
 ![](RawScore.png)
 
