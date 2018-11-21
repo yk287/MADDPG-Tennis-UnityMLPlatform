@@ -14,7 +14,6 @@ def transpose_to_tensor(input_list):
 
 
 # https://github.com/ikostrikov/pytorch-ddpg-naf/blob/master/ddpg.py#L11
-
 def soft_update(target, source, tau):
     """
     Perform DDPG soft update (move target params toward source based on weight
@@ -28,7 +27,6 @@ def soft_update(target, source, tau):
         target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
 # https://github.com/ikostrikov/pytorch-ddpg-naf/blob/master/ddpg.py#L15
-
 def hard_update(target, source):
     """
     Copy network parameters from source to target
@@ -100,3 +98,10 @@ def gumbel_softmax(logits, temperature=0.5, hard=False):
         y_hard = onehot_from_logits(y)
         y = (y_hard - y).detach() + y
     return y
+
+"""def main():
+    torch.Tensor()
+    print(onehot_from_logits())
+
+if __name__=='__main__':
+    main()"""

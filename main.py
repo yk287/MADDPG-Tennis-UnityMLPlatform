@@ -1,137 +1,162 @@
 # main function that sets up environments
 # perform training loop
 
-from buffer import ReplayBuffer
 from maddpg import MADDPG
+from memory import ReplayBuffer
 import torch
 import numpy as np
-from UnityWrapper import Env
+import os
+from unityagents import UnityEnvironment
+from util import raw_score_plotter, plotter
+
 
 from collections import deque
-from util import raw_score_plotter, plotter
-import os
-
 
 
 def seeding(seed=1):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-model_dir = os.getcwd() + "/model_dir"
+def main():
+    seeding()
+    # number of parallel agents
 
-os.makedirs(model_dir, exist_ok=True)
+    env = UnityEnvironment(file_name="Tennis.x86_64")
+    env_name = 'Tennis'
 
-seeding()
-env = Env()
-env_name = 'Tennis'
+    # get the default brain
+    brain_name = env.brain_names[0]
+    brain = env.brains[brain_name]
+    env_info = env.reset(train_mode=True)[brain_name]
+    # number of agents
+    num_agents = len(env_info.agents)
 
-# number of training episodes.
-# change this to higher number to experiment. say 30000.
-number_of_episodes = 5000
-episode_length = 1000
-batchsize = 128
-# how many episodes to save policy and gif
-save_interval = 1000
-t = 0
+    # size of each action
+    action_size = brain.vector_action_space_size
 
-# amplitude of OU noise
-# this slowly decreases to 0
-noise = 1
-noise_reduction = 0.9999
+    # examine the state space
+    states = env_info.vector_observations
+    state_size = states.shape[-1]
 
-# how many episodes before update
-episode_per_update = 2
+    # number of training episodes.
+    # change this to higher number to experiment. say 30000.
+    number_of_episodes = 10000
+    episode_length = 10000
+    batchsize = 128
 
-# keep 5000 episodes worth of replay
-buffer = ReplayBuffer(int(500000), batchsize, seed=0)
+    # amplitude of OU noise
+    # this slowly decreases to 0
+    noise = 1
+    noise_reduction = 0.9999
 
-# initialize policy and critic
-state_size, action_size, num_agents = env.get_info()
+    log_path = os.getcwd() + "/log"
+    model_dir = os.getcwd() + "/model_dir"
 
-torch.set_num_threads(num_agents * 2)
+    os.makedirs(model_dir, exist_ok=True)
 
-maddpg = MADDPG(state_size, action_size, num_agents, seed=12345, discount_factor=0.95, tau=0.02)
+    # initialize memory buffer
+    buffer = ReplayBuffer(int(500000), batchsize, 0)
 
-PRINT_EVERY = 5
-scores_deque = deque(maxlen=100)
-threshold = 0.50
+    # initialize policy and critic
+    maddpg = MADDPG(state_size, action_size, num_agents, seed=12345, discount_factor=0.95, tau=0.02)
 
-avg_last_100 = []
-scores = []
+    #how often to update the MADDPG model
+    episode_per_update = 2
+    # training loop
+
+    PRINT_EVERY = 5
+    scores_deque = deque(maxlen=100)
+
+    # holds raw scores
+    scores = []
+    # holds avg scores of last 100 epsiodes
+    avg_last_100 = []
+
+    threshold = 0.5
+
+    # use keep_awake to keep workspace from disconnecting
+    for episode in range(number_of_episodes):
+
+        env_info = env.reset(train_mode=True)[brain_name]  # reset the environment
+        state = env_info.vector_observations  # get the current state (for each agent)
+        episode_reward_agent0 = 0
+        episode_reward_agent1 = 0
 
 
-for episode in range(number_of_episodes):
+        for agent in maddpg.maddpg_agent:
+            agent.noise.reset()
 
-    obs, obs_full, env_info = env.reset()
+        for episode_t in range(episode_length):
 
-    episode_reward = 0
+            actions = maddpg.act(torch.tensor(state, dtype=torch.float), noise=noise)
+            noise *= noise_reduction
 
-    agent0_reward = 0
-    agent1_reward = 0
+            actions_array = torch.stack(actions).detach().numpy()
 
-    for agent in maddpg.maddpg_agent:
-        agent.noise.reset()
+            env_info = env.step(actions_array)[brain_name]
+            next_state = env_info.vector_observations
 
-    for i in range(episode_length):
+            reward = env_info.rewards
+            done = env_info.local_done
 
-        actions = maddpg.act(torch.tensor(obs, dtype=torch.float), noise=noise)
+            episode_reward_agent0 += reward[0]
+            episode_reward_agent1 += reward[1]
+            # add data to buffer
 
-        actions_for_env = torch.stack(actions).detach().numpy()
+            '''
+            I can either hstack or concat two states here or do it in the update function in MADDPG
+            However I think it's easier to do it here, since in the update function I have batch_size to deal with
+            Although the replay buffer would have to hold more data by preprocessing and creating 2 new variables that 
+            hold essentially the same info as state, and next_state, but just concatenated.
+            '''
+            full_state = np.concatenate((state[0], state[1]))
+            full_next_state = np.concatenate((next_state[0], next_state[1]))
 
-        # step forward one frame
+            buffer.add(state, full_state, actions_array, reward, next_state, full_next_state, done)
 
-        next_obs, next_obs_full, rewards, dones, info = env.step(actions_for_env)
+            state = next_state
 
-        # add data to buffer
-        buffer.add(obs, obs_full, actions_for_env, rewards, next_obs, next_obs_full, dones)
+            # update once after every episode_per_update
+            if len(buffer) > batchsize and episode % episode_per_update == 0:
+                for i in range(num_agents):
+                    samples = buffer.sample()
+                    maddpg.update(samples, i)
+                maddpg.update_targets()  # soft update the target network towards the actual networks
 
-        agent0_reward += rewards[0]
-        agent1_reward += rewards[1]
+            if np.any(done):
+                #if any of the agents are done break
+                break
 
-        obs = next_obs
-        obs_full = next_obs_full
+        episode_reward = max(episode_reward_agent0, episode_reward_agent1)
+        scores.append(episode_reward)
+        scores_deque.append(episode_reward)
+        avg_last_100.append(np.mean(scores_deque))
+        # scores.append(episode_reward)
+        print('\rEpisode {}\tAverage Score: {:.4f}\tScore: {:.4f}'.format(episode, avg_last_100[-1],
+                                                                                        episode_reward),
+              end="")
 
-        noise *= noise_reduction
+        if episode % PRINT_EVERY == 0:
+            print('\rEpisode {}\tAverage Score: {:.4f}'.format(episode, avg_last_100[-1]))
 
-        if len(buffer) > batchsize and episode % episode_per_update == 0:
-            for a_i in range(num_agents):
-                samples = buffer.sample(batchsize)
-                maddpg.update(samples, a_i)
-            maddpg.update_targets()
+        # saving successful model
+        #training ends when the threshold value is reached.
+        if avg_last_100[-1] >= threshold:
+            save_dict_list = []
 
-        if np.any(dones):
-            #if any of the agents are done break
+            for i in range(num_agents):
+                save_dict = {'actor_params': maddpg.maddpg_agent[i].actor.state_dict(),
+                             'actor_optim_params': maddpg.maddpg_agent[i].actor_optimizer.state_dict(),
+                             'critic_params': maddpg.maddpg_agent[i].critic.state_dict(),
+                             'critic_optim_params': maddpg.maddpg_agent[i].critic_optimizer.state_dict()}
+                save_dict_list.append(save_dict)
+
+                torch.save(save_dict_list,
+                           os.path.join(model_dir, 'episode-{}.pt'.format(episode)))
+            # plots graphs
+            raw_score_plotter(scores)
+            plotter(env_name, len(scores), avg_last_100, threshold)
             break
 
-    #We take the max rewards between agents
-
-    episode_reward = max(agent0_reward, agent1_reward)
-    scores.append(episode_reward)
-    scores_deque.append(episode_reward)
-    avg_last_100.append(np.mean(scores_deque))
-
-    #scores.append(episode_reward)
-
-    if episode % PRINT_EVERY == 0:
-        print('\rEpisode {}\tAverage Score: {:.4f}\tScore: {:.4f}'.format(episode, avg_last_100[-1], episode_reward))
-
-    if avg_last_100[-1] >= threshold:
-        # If the mean of last 100 rewards is greater than the threshold, save the model and plot graphs
-        # saving model
-        save_dict_list = []
-
-        for i in range(num_agents):
-            save_dict = {'actor_params': maddpg.maddpg_agent[i].actor.state_dict(),
-                         'actor_optim_params': maddpg.maddpg_agent[i].actor_optimizer.state_dict(),
-                         'critic_params': maddpg.maddpg_agent[i].critic.state_dict(),
-                         'critic_optim_params': maddpg.maddpg_agent[i].critic_optimizer.state_dict()}
-            save_dict_list.append(save_dict)
-
-            torch.save(save_dict_list,
-                       os.path.join(model_dir, 'episode-{}.pt'.format(episode)))
-
-        break
-
-
-raw_score_plotter(scores)
-plotter(env_name, len(scores), avg_last_100, threshold)
+if __name__ == '__main__':
+    main()

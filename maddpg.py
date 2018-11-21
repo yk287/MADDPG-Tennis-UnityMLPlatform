@@ -4,19 +4,25 @@
 
 from ddpg import DDPGAgent
 import torch
-from utilities import soft_update, transpose_to_tensor, transpose_list
+from utilities import soft_update
 import torch.nn.functional as F
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class MADDPG:
-    def __init__(self, state_size, action_size, num_agents, seed, discount_factor=0.99, tau=0.001):
+    def __init__(self, state_size, action_size, num_agents, seed, discount_factor=0.95, tau=0.02):
         super(MADDPG, self).__init__()
+
+        #initialize 2 DDPGAgents.
+
+        self.state_size = state_size
+        self.action_size = action_size
         self.num_agents = num_agents
-        self.maddpg_agent = [DDPGAgent(state_size, action_size,  num_agents, seed),
-                             DDPGAgent(state_size, action_size,  num_agents, seed)]
-        
+
+        self.maddpg_agent = [DDPGAgent(state_size, action_size, num_agents, seed),
+                             DDPGAgent(state_size, action_size, num_agents, seed)]
+
         self.discount_factor = discount_factor
         self.tau = tau
         self.iter = 0
@@ -33,77 +39,94 @@ class MADDPG:
 
     def act(self, obs_all_agents, noise=0.0):
         """get actions from all agents in the MADDPG object"""
+        """Takes in a 2 X 24 so need to process 1 X 24 states per each agent"""
+
         actions = []
 
         for i in range(self.num_agents):
-            obs = obs_all_agents[i, :].view(1, -1)
-            action = self.maddpg_agent[i].act(obs, noise).squeeze()
-            actions.append(action)
+            action = self.maddpg_agent[i].act(obs_all_agents[i, :].view(1, -1), noise) #without view dim is [24]
+            actions.append(action.squeeze()) #without squeeze dim is (1 X 2 X 2) in the main code
 
         return actions
 
     def target_act(self, obs_all_agents, noise=0.0):
         """get target network actions from all the agents in the MADDPG object """
 
-        next_actions = []
+        target_actions = []
 
         for i in range(self.num_agents):
 
-            next_obs = obs_all_agents[:,i,:]
-            next_action = self.maddpg_agent[i].target_act(next_obs, noise).to(device)
-            next_actions.append(next_action)
+            action = self.maddpg_agent[i].target_act(obs_all_agents[:, i, :],  noise)  # without view dim is [24]
+            target_actions.append(action)  # without squeeze dim is (1 X 2 X 2) in the main code
 
-        return next_actions
+        return target_actions
 
     def update(self, samples, agent_number):
         """update the critics and actors of all the agents """
 
-        obs, obs_full, action, reward, next_obs, next_obs_full, done =  samples
+        state, full_state, action, reward, next_state, full_next_state, done = samples
 
-        batch_size = obs_full.shape[0]
+        '''
+        instead of loading in full_state, and full_next_state, I could just sample state and next_state and then combine 
+        them into Batch_size * State_size tensors as well.
+        
+        '''
 
-        target_actions = self.target_act(next_obs.view([batch_size, self.num_agents, -1]))
+        batch_size = full_state.shape[0]
 
-        #get the agent that corresponds to the agent number
         agent = self.maddpg_agent[agent_number]
-
         agent.critic_optimizer.zero_grad()
 
+        # critic loss = batch mean of (y- Q(s,a) from target network)^2
+        # y = reward of this timestep + discount * Q(st+1,at+1) from target network
+
+        #change the shape to batch_size X num_agents X remaining.
+        #by changing the shape we can select local observations by agents by selecting [:, i, :] for i in range(num_agents)
+
+        target_actions = self.target_act(next_state.view(batch_size, self.num_agents, -1))
+
+        #turn a list of 2x2 into a batch_size x (action_size * num_agent)
         target_actions = torch.cat(target_actions, dim=1)
 
         with torch.no_grad():
-            q_next = agent.target_critic(next_obs_full, target_actions)
+            q_next = agent.target_critic(full_next_state, target_actions.to(device))
 
+        #shape of reward is batch_size X num_agents so [:, agent_number] is needed to pick the rewards for the specific agent
+        #that is being updated.
         y = reward[:, agent_number].view(-1, 1) + self.discount_factor * q_next * (1 - done[:, agent_number].view(-1, 1))
 
-        q = agent.critic(obs_full, action.view(batch_size, -1))
+        q = agent.critic(full_state, action.view(batch_size, -1))
 
-        #we can use huber_loss instead but I'm using MSE
-        #huber_loss = torch.nn.SmoothL1Loss()
         critic_loss = F.mse_loss(q, y.detach())
+
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 1)
         agent.critic_optimizer.step()
 
-        #update actor network using policy gradient
+        # update actor network using policy gradient
         agent.actor_optimizer.zero_grad()
-
         # make input to agent
         # detach the other agents to save computation
         # saves some time for computing derivative
-        q_input = [self.maddpg_agent[i].actor(obs.view([batch_size, self.num_agents, -1])[:, i, :]) if i == agent_number else self.maddpg_agent[i].actor(obs.view([batch_size, self.num_agents, -1])[:, i, :]).detach() for i in range(self.num_agents)]
+        q_input = [
+            self.maddpg_agent[i].actor(state.view([batch_size, self.num_agents, -1])[:, i, :]) if i == agent_number else
+            self.maddpg_agent[i].actor(state.view([batch_size, self.num_agents, -1])[:, i, :]).detach() for i in
+            range(self.num_agents)]
 
         q_input = torch.cat(q_input, dim=1)
-        # combine all the actions and observations for input to critic
 
+        # combine all the actions and observations for input to critic
+        # many of the obs are redundant, and obs[1] contains all useful information already
 
         # get the policy gradient
-        actor_loss = -agent.critic(obs_full, q_input).mean()
+        actor_loss = -agent.critic(full_state, q_input).mean()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1)
         agent.actor_optimizer.step()
 
-        #soft update the models
+        # soft update the models
+        # having update in here as well makes the model converge faster
+        # I could increase the trasnfer rate as well. instead of having updates called twice.
         self.update_targets()
 
     def update_targets(self):
@@ -112,9 +135,9 @@ class MADDPG:
         for ddpg_agent in self.maddpg_agent:
             soft_update(ddpg_agent.target_actor, ddpg_agent.actor, self.tau)
             soft_update(ddpg_agent.target_critic, ddpg_agent.critic, self.tau)
-            
-            
-            
+
+
+
 
 
 
